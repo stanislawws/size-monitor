@@ -1,0 +1,32 @@
+name: Daily size check
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # codziennie 06:00 UTC
+  workflow_dispatch:       # pozwala uruchomić ręcznie z karty Actions
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - run: python -m playwright install --with-deps chromium
+
+      - name: Zapisz klucz konta serwisowego do pliku
+        run: |
+          echo "$SERVICE_ACCOUNT_JSON" > service_account.json
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+
+      - name: Uruchom monitor
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SERVICE_ACCOUNT_JSON_PATH: service_account.json
+        run: python monitor_sizes.py
