@@ -1,3 +1,4 @@
+# monitor_sizes.py
 from datetime import datetime
 import os
 import re
@@ -6,9 +7,13 @@ import json
 
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import WorksheetNotFound
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]          # <- ustawione jako sekret w GitHub Actions
+# ======= Konfiguracja przez zmienne środowiskowe =======
+# SPREADSHEET_ID            -> ID arkusza (z URL: między /d/ a /edit)
+# SERVICE_ACCOUNT_JSON_PATH -> ścieżka do pliku klucza JSON (np. "service_account.json")
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON_PATH", "service_account.json")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -17,10 +22,34 @@ GS = gspread.authorize(CREDS)
 
 DATE_FMT = "%Y-%m-%d"
 
+# Teksty spotykane na polskich sklepach / fallback EN
 ADD_TO_CART_TEXTS = ["Dodaj do koszyka", "Do koszyka", "Add to cart"]
-NOTIFY_TEXTS = ["Powiadom", "Powiadom o dostępności", "Powiadom mnie o dostępności", "Notify", "Availability"]
-COOKIE_TEXTS = ["Akceptuj", "Zgadzam się", "Accept", "Rozumiem"]
+NOTIFY_TEXTS     = ["Powiadom", "Powiadom o dostępności", "Powiadom mnie o dostępności", "Notify", "Availability"]
+COOKIE_TEXTS     = ["Akceptuj", "Zgadzam się", "Accept", "Rozumiem"]
 
+# =======================================================
+# Pomocnicze: tworzenie zakładek, jeżeli ich nie ma
+# =======================================================
+def get_or_create_worksheet(sh, title, headers):
+    """
+    Zwraca worksheet o nazwie 'title'.
+    Jeśli nie istnieje – tworzy go i wpisuje nagłówki.
+    Jeśli istnieje, ale pusty – dopisze nagłówki.
+    """
+    try:
+        ws = sh.worksheet(title)
+        # Jeżeli worksheet jest pusty – dołóż nagłówki
+        if not ws.get_all_values():
+            ws.append_row(headers, value_input_option="RAW")
+        return ws
+    except WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=100, cols=max(10, len(headers)))
+        ws.append_row(headers, value_input_option="RAW")
+        return ws
+
+# =======================================================
+# UI helpers
+# =======================================================
 def _any_visible_enabled(page, texts):
     for t in texts:
         loc = page.locator(f"button:has-text('{t}')")
@@ -28,7 +57,7 @@ def _any_visible_enabled(page, texts):
             if loc.first.is_visible():
                 if loc.first.get_attribute("disabled") is None and loc.first.get_attribute("aria-disabled") not in ("true", "1"):
                     return True
-        except:
+        except Exception:
             pass
     return False
 
@@ -37,7 +66,7 @@ def _any_visible(page, texts):
         try:
             if page.locator(f"button:has-text('{t}')").first.is_visible():
                 return True
-        except:
+        except Exception:
             pass
     return False
 
@@ -47,11 +76,12 @@ def accept_cookies(page):
             page.locator(f"button:has-text('{t}')").first.click(timeout=1500)
             time.sleep(0.2)
             return
-        except:
+        except Exception:
             pass
 
-# ====== Ekstrakcja product_id ======
-
+# =======================================================
+# Ekstrakcja product_id (kilka heurystyk)
+# =======================================================
 def extract_product_id(page, url):
     # 1) z adresu /pl/p/<slug>/<ID>
     m = re.search(r"/pl/p/[^/]+/(\d+)", url)
@@ -63,7 +93,7 @@ def extract_product_id(page, url):
         pid = page.eval_on_selector("product-codes[product-id]", "el => el.getAttribute('product-id')")
         if pid and pid.strip().isdigit():
             return pid.strip()
-    except:
+    except Exception:
         pass
 
     # 3) dowolny element z atrybutem product-id
@@ -71,7 +101,7 @@ def extract_product_id(page, url):
         pid = page.eval_on_selector("[product-id]", "el => el.getAttribute('product-id')")
         if pid and pid.strip().isdigit():
             return pid.strip()
-    except:
+    except Exception:
         pass
 
     # 4) hidden input w formularzu koszyka
@@ -82,7 +112,7 @@ def extract_product_id(page, url):
             pid = page.eval_on_selector(sel, "el => el.value")
             if pid and pid.strip().isdigit():
                 return pid.strip()
-        except:
+        except Exception:
             pass
 
     # 5) data-product-id na przyciskach
@@ -90,7 +120,7 @@ def extract_product_id(page, url):
         pid = page.eval_on_selector("[data-product-id]", "el => el.getAttribute('data-product-id')")
         if pid and pid.strip().isdigit():
             return pid.strip()
-    except:
+    except Exception:
         pass
 
     # 6) JSON-LD – pola productID/@id/sku/mpn jeżeli czysto numeryczne
@@ -101,7 +131,7 @@ def extract_product_id(page, url):
             try:
                 jtxt = scripts.nth(i).inner_text()
                 data = json.loads(jtxt)
-            except:
+            except Exception:
                 continue
             items = data if isinstance(data, list) else [data]
             for obj in items:
@@ -110,14 +140,16 @@ def extract_product_id(page, url):
                         val = obj.get(key)
                         if isinstance(val, str) and val.isdigit():
                             return val
-    except:
+    except Exception:
         pass
 
     return ""  # nie znaleziono
 
-# ====== Koniec ekstrakcji product_id ======
-
+# =======================================================
+# Wyszukanie grupy wariantów "Rozmiar"
+# =======================================================
 def find_size_group(page):
+    # web-component z "radio" wariantami
     radio_groups = page.locator("radio-variant-option")
     try:
         for i in range(radio_groups.count()):
@@ -125,9 +157,10 @@ def find_size_group(page):
             label = (el.get_attribute("validation-name-label") or el.text_content() or "").strip()
             if re.search(r"rozmiar", label, re.I):
                 return "radio", el
-    except:
+    except Exception:
         pass
 
+    # web-component z selectem
     select_groups = page.locator("select-variant-option")
     try:
         for i in range(select_groups.count()):
@@ -135,15 +168,16 @@ def find_size_group(page):
             label = (el.get_attribute("validation-name-label") or el.text_content() or "").strip()
             if re.search(r"rozmiar", label, re.I):
                 return "select", el
-    except:
+    except Exception:
         pass
 
+    # fallback – nagłówek "Rozmiar", a potem kafelki/przyciski w dół DOM
     try:
         header = page.locator("text=Rozmiar").first
         if header and header.is_visible():
             container = header.locator("xpath=..")
             return "fallback", container
-    except:
+    except Exception:
         pass
 
     return None, None
@@ -154,10 +188,13 @@ def extract_product_name(page):
             t = page.locator(sel).first.inner_text().strip()
             if t:
                 return t
-        except:
+        except Exception:
             continue
     return ""
 
+# =======================================================
+# Enumeracja rozmiarów + sprawdzenie dostępności
+# =======================================================
 def enumerate_sizes_and_availability(page, group_type, root):
     sizes_all, sizes_avail = [], []
 
@@ -181,7 +218,7 @@ def enumerate_sizes_and_availability(page, group_type, root):
                     lab.click(timeout=2000)
                     page.wait_for_timeout(300)
                     mark_availability(txt)
-                except:
+                except Exception:
                     pass
 
     elif group_type == "select":
@@ -197,7 +234,7 @@ def enumerate_sizes_and_availability(page, group_type, root):
                 select.select_option(value=opt.get_attribute("value"))
                 page.wait_for_timeout(300)
                 mark_availability(txt)
-            except:
+            except Exception:
                 pass
 
     else:  # fallback
@@ -214,25 +251,27 @@ def enumerate_sizes_and_availability(page, group_type, root):
                     lab.click(timeout=2000)
                     page.wait_for_timeout(300)
                     mark_availability(txt)
-                except:
+                except Exception:
                     pass
 
-    def dedup(seq):
-        seen=set(); out=[]
-        for x in seq:
-            if x not in seen:
-                out.append(x); seen.add(x)
-        return out
+    # deduplikacja z zachowaniem kolejności
+    seen = set()
+    sizes_all = [x for x in sizes_all if not (x in seen or seen.add(x))]
+    seen.clear()
+    sizes_avail = [x for x in sizes_avail if not (x in seen or seen.add(x))]
 
-    return dedup(sizes_all), dedup(sizes_avail)
+    return sizes_all, sizes_avail
 
+# =======================================================
+# Skan pojedynczego produktu
+# =======================================================
 def probe_product(url, browser):
     page = browser.new_page()
     try:
         page.goto(url, timeout=60000)
         accept_cookies(page)
         try:
-            page.wait_for_timeout(500)  # krótka pauza na inicjalizację komponentów
+            page.wait_for_timeout(500)  # inicjalizacja komponentów
             page.wait_for_selector("text=Wybierz wariant produktu", timeout=5000)
         except PWTimeout:
             pass
@@ -259,12 +298,15 @@ def probe_product(url, browser):
     finally:
         try:
             page.close()
-        except:
+        except Exception:
             pass
 
+# =======================================================
+# Operacje na Arkuszu
+# =======================================================
 def read_product_urls():
     sh = GS.open_by_key(SPREADSHEET_ID)
-    ws = sh.worksheet("Products")
+    ws = get_or_create_worksheet(sh, "Products", ["product_id", "url"])
     vals = ws.get_all_values()
     urls = []
     if not vals:
@@ -276,16 +318,16 @@ def read_product_urls():
             if len(r) > 1 and r[1].startswith("http"):
                 urls.append(r[1])
     else:
-        urls = [r[0] for r in vals if r and r[0].startswith("http")]
+        urls = [r[0] for r in vals[1:] if r and len(r) > 0 and r[0].startswith("http")]
     return urls
 
 def maybe_update_products_id(url, pid):
-    """Jeśli arkusz 'Products' ma układ [product_id, url] i A jest puste — uzupełnij ID."""
+    """Jeśli 'Products' ma układ [product_id, url] i A jest puste — uzupełnij ID."""
     if not pid:
         return
     try:
         sh = GS.open_by_key(SPREADSHEET_ID)
-        ws = sh.worksheet("Products")
+        ws = get_or_create_worksheet(sh, "Products", ["product_id", "url"])
         vals = ws.get_all_values()
         if not vals:
             return
@@ -301,7 +343,10 @@ def maybe_update_products_id(url, pid):
 
 def append_daily_row(result):
     sh = GS.open_by_key(SPREADSHEET_ID)
-    ws = sh.worksheet("Daily")
+    ws = get_or_create_worksheet(
+        sh, "Daily",
+        ["product_id", "date", "url", "product_name", "size_count", "sizes_avail", "sizes_all", "status"]
+    )
     today = datetime.utcnow().strftime(DATE_FMT)
     ws.append_row([
         result.get("product_id", ""),
@@ -314,15 +359,22 @@ def append_daily_row(result):
         result["status"]
     ], value_input_option="RAW")
 
+# =======================================================
+# Główna pętla
+# =======================================================
 def main():
     urls = read_product_urls()
+    if not urls:
+        print("Brak URL-i w zakładce 'Products'. Dodaj co najmniej jeden adres produktu i uruchom ponownie.")
+        return
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         for url in urls:
             res = probe_product(url, browser)
             append_daily_row(res)
             maybe_update_products_id(url, res.get("product_id", ""))
-            time.sleep(0.7)  # łagodne tempo
+            time.sleep(0.7)  # łagodne tempo, szacunek dla sklepu
         browser.close()
 
 if __name__ == "__main__":
