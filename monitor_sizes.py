@@ -17,26 +17,25 @@ GS = gspread.authorize(CREDS)
 
 DATE_FMT = "%Y-%m-%d"
 
-# Tryb zliczania dostępności:
-# True  -> rozmiar jest "dostępny", jeśli w JAKIEJKOLWIEK kombinacji innych atrybutów (np. kolorach) da się go kupić (zalecane)
-# False -> rozmiar liczony tylko dla domyślnych wyborów pozostałych atrybutów
+# Tryb zliczania:
+# True  -> rozmiar uznajemy za dostępny, jeśli w JAKIEJKOLWIEK kombinacji innych atrybutów (np. kolorów) da się go kupić (fallback)
+# False -> liczymy dla bieżących ustawień atrybutów
 UNION_MODE = True
 
-# Limity przeszukiwania kombinacji innych atrybutów (dla wydajności)
-MAX_OPTIONS_PER_GROUP = 4        # rozważamy do 4 pierwszych opcji z każdej grupy
-MAX_PAIRWISE_CHECKS    = 16       # maksymalnie 4x4 przy testach par atrybutów
+# Limity dla grup INNYCH niż „Rozmiar” (dla wydajności w trybie fallback)
+MAX_OPTIONS_PER_GROUP = 6
+MAX_PAIRWISE_CHECKS   = 24
 
-# Teksty przycisków/komunikatów (PL + fallback EN)
+# Teksty przycisków/komunikatów (PL + EN)
 ADD_TO_CART_TEXTS = ["Dodaj do koszyka", "Do koszyka", "Add to cart"]
 NOTIFY_TEXTS      = ["Powiadom", "Powiadom o dostępności", "Powiadom mnie o dostępności", "Notify", "Availability"]
 OOS_TEXTS         = ["Brak towaru", "Niedostępny", "Out of stock"]
-
 COOKIE_TEXTS      = ["Akceptuj", "Zgadzam się", "Accept", "Rozumiem"]
 
 # Timeouts/waity (ms)
-GOTO_TIMEOUT   = 15000
-WAIT_SELECTOR  = 4000
-POST_CLICK_WAIT= 350
+GOTO_TIMEOUT    = 15000
+WAIT_SELECTOR   = 4000
+POST_CLICK_WAIT = 500
 
 # ================= Arkusze =================
 def get_or_create_worksheet(sh, title, headers):
@@ -52,7 +51,6 @@ def get_or_create_worksheet(sh, title, headers):
 
 # ================= Helpery UI =================
 def _any_visible_enabled(page: Page, texts):
-    # sprawdzamy button/a/[role=button] z podanym tekstem
     for t in texts:
         for sel in [f"button:has-text('{t}')", f"a:has-text('{t}')", f"[role='button']:has-text('{t}')"]:
             try:
@@ -86,7 +84,6 @@ def accept_cookies(page: Page):
 
 def scroll_into_view_of_variants(page: Page):
     try:
-        # przewiń w okolice wariantów/cta
         page.locator("text=Wybierz wariant produktu").first.scroll_into_view_if_needed(timeout=800)
     except Exception:
         try:
@@ -94,11 +91,11 @@ def scroll_into_view_of_variants(page: Page):
         except Exception:
             pass
 
-# ================= Warianty (grupy i opcje) =================
+# ================= Warianty =================
 class VariantGroup:
     def __init__(self, kind, root, label):
         self.kind = kind      # "radio" | "select" | "fallback"
-        self.root = root
+        self.root = root      # Playwright Locator
         self.label = (label or "").strip()
 
     def __repr__(self):
@@ -107,7 +104,7 @@ class VariantGroup:
 def get_variant_groups(page: Page):
     groups = []
 
-    # radio-variant-option
+    # radio-variant-option (kafelki)
     radio_groups = page.locator("radio-variant-option")
     try:
         for i in range(radio_groups.count()):
@@ -117,7 +114,7 @@ def get_variant_groups(page: Page):
     except Exception:
         pass
 
-    # select-variant-option
+    # select-variant-option (rozwijane)
     select_groups = page.locator("select-variant-option")
     try:
         for i in range(select_groups.count()):
@@ -141,13 +138,74 @@ def get_variant_groups(page: Page):
 def group_is_size(g: VariantGroup):
     return bool(re.search(r"\brozmiar\b", g.label, re.I))
 
-def list_options_for_group(g: VariantGroup):
+# ================== NOWE: statyczny odczyt rozmiarów (bez klikania) ==================
+def read_sizes_static_from_radio(size_group: VariantGroup):
     """
-    Zwraca listę "opcji" do wyboru w danej grupie.
-    Dla radio/fallback: zwracamy listę lokatorów etykiet (label/button/..).
-    Dla select: zwracamy listę krotek (value, text, locator_option).
-    Filtrujemy śmieci ("Wybierz..."), ograniczamy do MAX_OPTIONS_PER_GROUP.
+    Dla <radio-variant-option> Shoper zwraca inputy:
+      <input class="radio-box__input" id="option-...-NNN" data-user-value="S|M|..." [data-option-value-unavailable="1"]>
+    Logika:
+      - sizes_all: zawartość data-user-value dla wszystkich inputów
+      - sizes_avail: te, które NIE mają data-option-value-unavailable="1" i nie są disabled
     """
+    sizes_all = []
+    sizes_avail = []
+    try:
+        inputs = size_group.root.locator("input.radio-box__input")
+        cnt = inputs.count()
+        for i in range(cnt):
+            inp = inputs.nth(i)
+            label = (inp.get_attribute("data-user-value") or "").strip()
+            if not label:
+                # awaryjnie: label z <label for="...">
+                _id = inp.get_attribute("id")
+                if _id:
+                    lab = size_group.root.locator(f"label[for='{_id}']").first
+                    try:
+                        label = (lab.inner_text() or "").strip()
+                    except Exception:
+                        label = ""
+            if not label:
+                continue
+            sizes_all.append(label)
+
+            unavailable = (inp.get_attribute("data-option-value-unavailable") == "1")
+            disabled    = (inp.get_attribute("disabled") is not None) or ((inp.get_attribute("aria-disabled") or "").lower() in ("true","1"))
+            klass       = (inp.get_attribute("class") or "")
+            looks_oos   = bool(re.search(r"unavailable|out[-_ ]?of[-_ ]?stock|sold|disabled", klass, re.I))
+
+            if not (unavailable or disabled or looks_oos):
+                sizes_avail.append(label)
+    except Exception:
+        pass
+    return sizes_all, sizes_avail
+
+def read_sizes_static_from_select(size_group: VariantGroup):
+    """
+    Dla <select-variant-option>:
+      <select> <option value="...">S</option> lub <option disabled>XL</option>
+    """
+    sizes_all, sizes_avail = [], []
+    try:
+        sel = size_group.root.locator("select").first
+        options = sel.locator("option")
+        cnt = options.count()
+        for i in range(cnt):
+            opt = options.nth(i)
+            txt = (opt.text_content() or "").strip()
+            if not txt or re.search(r"wybierz", txt, re.I):
+                continue
+            sizes_all.append(txt)
+            disabled = opt.get_attribute("disabled") is not None
+            unavailable = (opt.get_attribute("data-option-value-unavailable") == "1")
+            if not (disabled or unavailable):
+                sizes_avail.append(txt)
+    except Exception:
+        pass
+    return sizes_all, sizes_avail
+
+# ================== Fallback (klikany) ==================
+def list_options_for_group(g: VariantGroup, limit=None):
+    cap = limit if (isinstance(limit, int) and limit > 0) else 10**6
     items = []
     try:
         if g.kind == "radio":
@@ -156,14 +214,11 @@ def list_options_for_group(g: VariantGroup):
             for i in range(cnt):
                 lab = labels.nth(i)
                 txt = (lab.text_content() or "").strip()
-                if not txt: 
+                if not txt or re.search(r"wybierz", txt, re.I):
                     continue
-                # krótkie etykiety rozmiarów/kolorów; odrzucamy sekcje typu "Rozmiar"
-                if re.search(r"wybierz", txt, re.I): 
-                    continue
-                if len(txt) <= 18:  # kolor bywa dłuższy niż rozmiar; dajemy margines
+                if len(txt) <= 18:
                     items.append(("radio", txt, lab))
-                if len(items) >= MAX_OPTIONS_PER_GROUP:
+                if len(items) >= cap:
                     break
 
         elif g.kind == "select":
@@ -177,11 +232,11 @@ def list_options_for_group(g: VariantGroup):
                 if not txt or re.search(r"wybierz", txt, re.I):
                     continue
                 items.append(("select", txt, (sel, val)))
-                if len(items) >= MAX_OPTIONS_PER_GROUP:
+                if len(items) >= cap:
                     break
 
         else:  # fallback
-            labels = g.root.locator("xpath=following::*[self::label or self::button or contains(@class,'radio') or contains(@class,'tile')][position()<=24]")
+            labels = g.root.locator("xpath=following::*[self::label or self::button or contains(@class,'radio') or contains(@class,'tile')][position()<=48]")
             cnt = labels.count()
             for i in range(cnt):
                 lab = labels.nth(i)
@@ -190,16 +245,13 @@ def list_options_for_group(g: VariantGroup):
                     continue
                 if len(txt) <= 18:
                     items.append(("radio", txt, lab))
-                if len(items) >= MAX_OPTIONS_PER_GROUP:
+                if len(items) >= cap:
                     break
     except Exception:
         pass
     return items
 
 def select_option(item, page: Page):
-    """
-    item: krotka zwrócona przez list_options_for_group
-    """
     typ, txt, payload = item
     try:
         if typ == "radio":
@@ -213,65 +265,56 @@ def select_option(item, page: Page):
         return False
 
 def is_current_variant_available(page: Page):
-    # Negatywne sygnały (brak stanu)
     if _any_visible(page, NOTIFY_TEXTS) or _any_visible(page, OOS_TEXTS):
         return False
-    # Pozytywne sygnały (można kupić)
     if _any_visible_enabled(page, ADD_TO_CART_TEXTS):
         return True
     return False
 
-# ================= Logika liczenia dostępności rozmiarów =================
 def check_size_availability_union(page: Page, size_group: VariantGroup, other_groups):
-    """
-    Sprawdza, czy DANY rozmiar jest dostępny w JAKIEJKOLWIEK kombinacji innych atrybutów.
-    Strategia: domyślne -> pojedyncze zmiany -> pary.
-    """
-    size_options = list_options_for_group(size_group)
-    other_opts = [list_options_for_group(g) for g in other_groups]
-
-    available_sizes = []
+    size_options = list_options_for_group(size_group, limit=None)  # pełna lista rozmiarów
     all_size_labels = [o[1] for o in size_options]
+    other_opts = [list_options_for_group(g, limit=MAX_OPTIONS_PER_GROUP) for g in other_groups]
 
-    # Przygotuj "domyślne" pierwsze opcje dla innych grup (o ile istnieją)
     def select_defaults_for_others():
         for opts in other_opts:
             if opts:
                 select_option(opts[0], page)
 
+    available_sizes = []
+
     for s_item in size_options:
         size_label = s_item[1]
-        # 1) domyślne wybory innych grup
+
+        # Domyślne wybory
         select_defaults_for_others()
         select_option(s_item, page)
         if is_current_variant_available(page):
             available_sizes.append(size_label)
             continue
 
-        # 2) pojedyncze zmiany w innych grupach
-        success = False
-        for gi, opts in enumerate(other_opts):
-            for oi, item in enumerate(opts[:MAX_OPTIONS_PER_GROUP]):
+        # Pojedyncze zmiany
+        found = False
+        for opts in other_opts:
+            for item in opts:
                 select_defaults_for_others()
-                # ustaw wybraną grupę gi na alternatywę item
                 select_option(item, page)
                 select_option(s_item, page)
                 if is_current_variant_available(page):
                     available_sizes.append(size_label)
-                    success = True
+                    found = True
                     break
-            if success: 
+            if found:
                 break
-        if success:
+        if found:
             continue
 
-        # 3) pary grup (prosty, ale skuteczny produkt kart.)
-        # ograniczamy liczbę prób do MAX_PAIRWISE_CHECKS
+        # Pary
         tried = 0
         if len(other_opts) >= 2:
             for (opts_a, opts_b) in itertools.combinations(other_opts, 2):
-                for item_a in opts_a[:MAX_OPTIONS_PER_GROUP]:
-                    for item_b in opts_b[:MAX_OPTIONS_PER_GROUP]:
+                for item_a in opts_a:
+                    for item_b in opts_b:
                         tried += 1
                         if tried > MAX_PAIRWISE_CHECKS:
                             break
@@ -281,33 +324,12 @@ def check_size_availability_union(page: Page, size_group: VariantGroup, other_gr
                         select_option(s_item, page)
                         if is_current_variant_available(page):
                             available_sizes.append(size_label)
-                            success = True
+                            found = True
                             break
-                    if success or tried > MAX_PAIRWISE_CHECKS:
+                    if found or tried > MAX_PAIRWISE_CHECKS:
                         break
-                if success or tried > MAX_PAIRWISE_CHECKS:
+                if found or tried > MAX_PAIRWISE_CHECKS:
                     break
-
-    return all_size_labels, available_sizes
-
-def check_size_availability_simple(page: Page, size_group: VariantGroup, other_groups):
-    """
-    Prosty tryb: ustaw inne grupy na pierwsze opcje i licz rozmiary tylko dla tej jednej kombinacji.
-    """
-    size_options = list_options_for_group(size_group)
-    all_size_labels = [o[1] for o in size_options]
-
-    # ustaw domyślne (pierwsze) wartości innych grup
-    for g in other_groups:
-        opts = list_options_for_group(g)
-        if opts:
-            select_option(opts[0], page)
-
-    available_sizes = []
-    for s_item in size_options:
-        select_option(s_item, page)
-        if is_current_variant_available(page):
-            available_sizes.append(s_item[1])
 
     return all_size_labels, available_sizes
 
@@ -317,27 +339,16 @@ def extract_product_id(page: Page, url: str):
     if m:
         return m.group(1)
 
-    try:
-        pid = page.eval_on_selector("product-codes[product-id]", "el => el.getAttribute('product-id')")
-        if pid and pid.strip().isdigit():
-            return pid.strip()
-    except Exception:
-        pass
-    try:
-        pid = page.eval_on_selector("[product-id]", "el => el.getAttribute('product-id')")
-        if pid and pid.strip().isdigit():
-            return pid.strip()
-    except Exception:
-        pass
-    for sel in ["form[action*='cart'] input[name='id']",
-                "form[action*='basket'] input[name='id']",
-                "input[name='product_id']",
-                "[data-product-id]"]:
+    for sel, getter in [
+        ("product-codes[product-id]", "el => el.getAttribute('product-id')"),
+        ("[product-id]", "el => el.getAttribute('product-id')"),
+        ("form[action*='cart'] input[name='id']", "el => el.value"),
+        ("form[action*='basket'] input[name='id']", "el => el.value"),
+        ("input[name='product_id']", "el => el.value"),
+        ("[data-product-id]", "el => el.getAttribute('data-product-id')"),
+    ]:
         try:
-            if "data-" in sel:
-                pid = page.eval_on_selector(sel, "el => el.getAttribute('data-product-id')")
-            else:
-                pid = page.eval_on_selector(sel, "el => el.value")
+            pid = page.eval_on_selector(sel, getter)
             if pid and str(pid).strip().isdigit():
                 return str(pid).strip()
         except Exception:
@@ -397,13 +408,42 @@ def probe_product(url, browser):
             print("   (brak grupy 'Rozmiar')")
             return dict(product_id=product_id, url=url, name=product_name, sizes_all=[], sizes_avail=[], size_count=0, status="no_size_group")
 
-        size_group = size_groups[0]  # zwykle jedna
+        size_group = size_groups[0]
+
+        # --- PRIORYTET: statyczny odczyt bez klikania ---
+        sizes_all, sizes_avail = [], []
+        if size_group.kind == "radio":
+            sizes_all, sizes_avail = read_sizes_static_from_radio(size_group)
+        elif size_group.kind == "select":
+            sizes_all, sizes_avail = read_sizes_static_from_select(size_group)
+
+        # Jeśli statycznie udało się coś wykryć – używamy (najdokładniejsze)
+        if sizes_all:
+            print(f"   [STATIC] Rozmiary: all={sizes_all} avail={sizes_avail} count={len(sizes_avail)}")
+            return dict(
+                product_id=product_id,
+                url=url,
+                name=product_name,
+                sizes_all=sizes_all,
+                sizes_avail=sizes_avail,
+                size_count=len(sizes_avail),
+                status="ok"
+            )
+
+        # --- Fallback: klikanie (np. bardzo stare motywy) ---
         if UNION_MODE:
             sizes_all, sizes_avail = check_size_availability_union(page, size_group, other_groups)
         else:
-            sizes_all, sizes_avail = check_size_availability_simple(page, size_group, other_groups)
+            # prosty tryb (nie używany, ale zostawiam na przyszłość)
+            opts = list_options_for_group(size_group, limit=None)
+            sizes_all = [o[1] for o in opts]
+            sizes_avail = []
+            for o in opts:
+                select_option(o, page)
+                if is_current_variant_available(page):
+                    sizes_avail.append(o[1])
 
-        print(f"   Rozmiary: all={sizes_all} avail={sizes_avail}")
+        print(f"   [FALLBACK] Rozmiary: all={sizes_all} avail={sizes_avail} count={len(sizes_avail)}")
         return dict(
             product_id=product_id,
             url=url,
@@ -413,6 +453,7 @@ def probe_product(url, browser):
             size_count=len(sizes_avail),
             status="ok"
         )
+
     except Exception as e:
         print("   ERROR:", e.__class__.__name__, str(e))
         return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status=f"error: {e.__class__.__name__}")
@@ -422,7 +463,7 @@ def probe_product(url, browser):
         except Exception:
             pass
 
-# ================= Arkusze: odczyt/zapis =================
+# ================= Arkusze =================
 def read_product_urls():
     sh = GS.open_by_key(SPREADSHEET_ID)
     ws = get_or_create_worksheet(sh, "Products", ["product_id", "url"])
