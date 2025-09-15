@@ -1,5 +1,6 @@
 # monitor_sizes.py
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import os, re, time, json, itertools
 
 import gspread
@@ -7,15 +8,15 @@ from google.oauth2.service_account import Credentials
 from gspread.exceptions import WorksheetNotFound
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
 
-# ================= Konfiguracja =================
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+# =============== Konfiguracja środowiska ===============
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]                 # ID arkusza (z URL między /d/ a /edit)
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON_PATH", "service_account.json")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 CREDS = Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON, scopes=SCOPES)
 GS = gspread.authorize(CREDS)
 
-DATE_FMT = "%Y-%m-%d"
+DATE_TZ = ZoneInfo("Europe/Warsaw")
 
 # Tryb zliczania:
 # True  -> rozmiar uznajemy za dostępny, jeśli w JAKIEJKOLWIEK kombinacji innych atrybutów (np. kolorów) da się go kupić (fallback)
@@ -37,8 +38,16 @@ GOTO_TIMEOUT    = 15000
 WAIT_SELECTOR   = 4000
 POST_CLICK_WAIT = 500
 
-# ================= Arkusze =================
+DAILY_HEADERS = ["product_id", "date", "url", "product_name", "size_count", "sizes_avail", "sizes_all", "status"]
+PRODUCTS_HEADERS = ["product_id", "url"]
+
+# =============== Arkusze ===============
 def get_or_create_worksheet(sh, title, headers):
+    """
+    Zwraca worksheet o nazwie 'title'.
+    Jeśli nie istnieje – tworzy go i wpisuje nagłówki.
+    Jeśli istnieje, ale pusty – dopisze nagłówki.
+    """
     try:
         ws = sh.worksheet(title)
         if not ws.get_all_values():
@@ -49,7 +58,17 @@ def get_or_create_worksheet(sh, title, headers):
         ws.append_row(headers, value_input_option="RAW")
         return ws
 
-# ================= Helpery UI =================
+def reset_daily_sheet(sh):
+    """
+    Czyści zakładkę 'Daily' i zostawia tylko nagłówek.
+    Dzięki temu w 'Daily' będą wyłącznie dane z bieżącego uruchomienia.
+    """
+    ws = get_or_create_worksheet(sh, "Daily", DAILY_HEADERS)
+    ws.clear()  # kasuje całą zawartość
+    ws.append_row(DAILY_HEADERS, value_input_option="RAW")
+    return ws
+
+# =============== Helpery UI ===============
 def _any_visible_enabled(page: Page, texts):
     for t in texts:
         for sel in [f"button:has-text('{t}')", f"a:has-text('{t}')", f"[role='button']:has-text('{t}')"]:
@@ -91,7 +110,7 @@ def scroll_into_view_of_variants(page: Page):
         except Exception:
             pass
 
-# ================= Warianty =================
+# =============== Warianty (grupy) ===============
 class VariantGroup:
     def __init__(self, kind, root, label):
         self.kind = kind      # "radio" | "select" | "fallback"
@@ -138,14 +157,13 @@ def get_variant_groups(page: Page):
 def group_is_size(g: VariantGroup):
     return bool(re.search(r"\brozmiar\b", g.label, re.I))
 
-# ================== NOWE: statyczny odczyt rozmiarów (bez klikania) ==================
+# =============== Statyczny odczyt rozmiarów (bez klikania) ===============
 def read_sizes_static_from_radio(size_group: VariantGroup):
     """
-    Dla <radio-variant-option> Shoper zwraca inputy:
-      <input class="radio-box__input" id="option-...-NNN" data-user-value="S|M|..." [data-option-value-unavailable="1"]>
-    Logika:
-      - sizes_all: zawartość data-user-value dla wszystkich inputów
-      - sizes_avail: te, które NIE mają data-option-value-unavailable="1" i nie są disabled
+    Dla <radio-variant-option> (Shoper):
+      <input class="radio-box__input" data-user-value="S|M|..." [data-option-value-unavailable="1"] ...>
+    sizes_all  = data-user-value wszystkich inputów
+    sizes_avail= te, które NIE mają data-option-value-unavailable="1" i nie są disabled
     """
     sizes_all = []
     sizes_avail = []
@@ -156,7 +174,6 @@ def read_sizes_static_from_radio(size_group: VariantGroup):
             inp = inputs.nth(i)
             label = (inp.get_attribute("data-user-value") or "").strip()
             if not label:
-                # awaryjnie: label z <label for="...">
                 _id = inp.get_attribute("id")
                 if _id:
                     lab = size_group.root.locator(f"label[for='{_id}']").first
@@ -181,8 +198,7 @@ def read_sizes_static_from_radio(size_group: VariantGroup):
 
 def read_sizes_static_from_select(size_group: VariantGroup):
     """
-    Dla <select-variant-option>:
-      <select> <option value="...">S</option> lub <option disabled>XL</option>
+    Dla <select-variant-option>: <option disabled> oznacza niedostępność.
     """
     sizes_all, sizes_avail = [], []
     try:
@@ -203,7 +219,7 @@ def read_sizes_static_from_select(size_group: VariantGroup):
         pass
     return sizes_all, sizes_avail
 
-# ================== Fallback (klikany) ==================
+# =============== Fallback (klikany) ===============
 def list_options_for_group(g: VariantGroup, limit=None):
     cap = limit if (isinstance(limit, int) and limit > 0) else 10**6
     items = []
@@ -333,7 +349,46 @@ def check_size_availability_union(page: Page, size_group: VariantGroup, other_gr
 
     return all_size_labels, available_sizes
 
-# ================= Skan pojedynczego produktu =================
+# =============== Rozpoznanie strony produktu / ID / tytułu ===============
+def is_product_page(page: Page) -> bool:
+    # 1) meta og:type=product
+    try:
+        og = page.locator("meta[property='og:type']").first
+        content = (og.get_attribute("content") or "").lower() if og else ""
+        if "product" in content:
+            return True
+    except Exception:
+        pass
+    # 2) JSON-LD z @type Product (również @graph)
+    try:
+        scripts = page.locator("script[type='application/ld+json']")
+        cnt = min(scripts.count(), 4)
+        for i in range(cnt):
+            try:
+                data = json.loads(scripts.nth(i).inner_text())
+            except Exception:
+                continue
+            items = data if isinstance(data, list) else [data]
+            for obj in items:
+                if isinstance(obj, dict):
+                    t = obj.get("@type")
+                    if isinstance(t, str) and "Product" in t:
+                        return True
+                    if isinstance(t, list) and any(isinstance(x, str) and "Product" in x for x in t):
+                        return True
+                    if "@graph" in obj and isinstance(obj["@graph"], list):
+                        if any(isinstance(g, dict) and g.get("@type") in ("Product","https://schema.org/Product","http://schema.org/Product") for g in obj["@graph"]):
+                            return True
+    except Exception:
+        pass
+    # 3) komponenty wariantów
+    try:
+        if page.locator("radio-variant-option, select-variant-option").count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
 def extract_product_id(page: Page, url: str):
     m = re.search(r"/pl/p/[^/]+/(\d+)", url)
     if m:
@@ -354,7 +409,7 @@ def extract_product_id(page: Page, url: str):
         except Exception:
             pass
 
-    # JSON-LD
+    # JSON-LD: productID/@id/sku/mpn (jeśli numeryczne)
     try:
         scripts = page.locator("script[type='application/ld+json']")
         count = min(scripts.count(), 6)
@@ -385,13 +440,35 @@ def extract_product_name(page: Page):
             continue
     return ""
 
+# =============== Skan pojedynczego produktu ===============
 def probe_product(url, browser):
     page = browser.new_page()
     try:
         print(f"==> URL: {url}")
-        page.goto(url, timeout=GOTO_TIMEOUT)
+        resp = page.goto(url, timeout=GOTO_TIMEOUT)
+        code = resp.status if resp else None
+        final_url = page.url
+
+        # Twarde kody HTTP
+        if code and code >= 400:
+            return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status=f"http_{code}")
+
         accept_cookies(page)
         scroll_into_view_of_variants(page)
+
+        # Strona nie wygląda na produkt?
+        if not is_product_page(page):
+            txt = ""
+            try:
+                txt = (page.inner_text("body") or "")[:2000]
+            except Exception:
+                pass
+            if re.search(r"404|nie znalezion|nie istnieje|usunięt|brak produktu", txt, re.I):
+                return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="product_removed")
+            if final_url.rstrip("/") != url.rstrip("/"):
+                return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="redirected_not_product")
+            return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="not_product_page")
+
         try:
             page.wait_for_selector("text=Wybierz wariant produktu", timeout=WAIT_SELECTOR)
         except PWTimeout:
@@ -417,7 +494,6 @@ def probe_product(url, browser):
         elif size_group.kind == "select":
             sizes_all, sizes_avail = read_sizes_static_from_select(size_group)
 
-        # Jeśli statycznie udało się coś wykryć – używamy (najdokładniejsze)
         if sizes_all:
             print(f"   [STATIC] Rozmiary: all={sizes_all} avail={sizes_avail} count={len(sizes_avail)}")
             return dict(
@@ -430,11 +506,10 @@ def probe_product(url, browser):
                 status="ok"
             )
 
-        # --- Fallback: klikanie (np. bardzo stare motywy) ---
+        # --- Fallback: klikanie (dla nietypowych motywów) ---
         if UNION_MODE:
             sizes_all, sizes_avail = check_size_availability_union(page, size_group, other_groups)
         else:
-            # prosty tryb (nie używany, ale zostawiam na przyszłość)
             opts = list_options_for_group(size_group, limit=None)
             sizes_all = [o[1] for o in opts]
             sizes_avail = []
@@ -454,6 +529,8 @@ def probe_product(url, browser):
             status="ok"
         )
 
+    except PWTimeout:
+        return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="timeout")
     except Exception as e:
         print("   ERROR:", e.__class__.__name__, str(e))
         return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status=f"error: {e.__class__.__name__}")
@@ -463,10 +540,10 @@ def probe_product(url, browser):
         except Exception:
             pass
 
-# ================= Arkusze =================
+# =============== Arkusze: odczyt/zapis ===============
 def read_product_urls():
     sh = GS.open_by_key(SPREADSHEET_ID)
-    ws = get_or_create_worksheet(sh, "Products", ["product_id", "url"])
+    ws = get_or_create_worksheet(sh, "Products", PRODUCTS_HEADERS)
     vals = ws.get_all_values()
     urls = []
     if not vals:
@@ -485,7 +562,7 @@ def maybe_update_products_id(url, pid):
         return
     try:
         sh = GS.open_by_key(SPREADSHEET_ID)
-        ws = get_or_create_worksheet(sh, "Products", ["product_id", "url"])
+        ws = get_or_create_worksheet(sh, "Products", PRODUCTS_HEADERS)
         vals = ws.get_all_values()
         if not vals:
             return
@@ -498,16 +575,11 @@ def maybe_update_products_id(url, pid):
     except Exception:
         pass
 
-def append_daily_row(result):
-    sh = GS.open_by_key(SPREADSHEET_ID)
-    ws = get_or_create_worksheet(
-        sh, "Daily",
-        ["product_id", "date", "url", "product_name", "size_count", "sizes_avail", "sizes_all", "status"]
-    )
-    today = datetime.utcnow().strftime(DATE_FMT)
-    ws.append_row([
+def append_daily_row(ws_daily, result):
+    today_local = datetime.now(DATE_TZ).date().isoformat()  # data w strefie Europe/Warsaw
+    ws_daily.append_row([
         result.get("product_id", ""),
-        today,
+        today_local,
         result["url"],
         result["name"],
         result["size_count"],
@@ -516,8 +588,13 @@ def append_daily_row(result):
         result["status"]
     ], value_input_option="RAW")
 
-# ================= Główna pętla =================
+# =============== Główna pętla ===============
 def main():
+    sh = GS.open_by_key(SPREADSHEET_ID)
+
+    # Czyścimy 'Daily' i zostawiamy tylko nagłówek – zawsze tylko aktualne dane
+    ws_daily = reset_daily_sheet(sh)
+
     urls = read_product_urls()
     if not urls:
         print("Brak URL-i w zakładce 'Products'. Dodaj co najmniej jeden adres produktu i uruchom ponownie.")
@@ -527,7 +604,7 @@ def main():
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         for url in urls:
             res = probe_product(url, browser)
-            append_daily_row(res)
+            append_daily_row(ws_daily, res)
             maybe_update_products_id(url, res.get("product_id", ""))
             time.sleep(0.5)  # łagodnie dla sklepu
         browser.close()
