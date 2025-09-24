@@ -64,9 +64,75 @@ def reset_daily_sheet(sh):
     Dzięki temu w 'Daily' będą wyłącznie dane z bieżącego uruchomienia.
     """
     ws = get_or_create_worksheet(sh, "Daily", DAILY_HEADERS)
-    ws.clear()  # kasuje całą zawartość
+    ws.clear()
     ws.append_row(DAILY_HEADERS, value_input_option="RAW")
     return ws
+
+def read_products_sheet():
+    """
+    Czyta zakładkę 'Products' jako listę słowników:
+    [{'url': ..., 'product_id': ...}, ...]
+    """
+    sh = GS.open_by_key(SPREADSHEET_ID)
+    ws = get_or_create_worksheet(sh, "Products", PRODUCTS_HEADERS)
+    vals = ws.get_all_values()
+    items = []
+    if not vals:
+        return items
+    header = [c.strip().lower() for c in vals[0]]
+    # Obsługujemy [product_id, url] oraz [url]
+    if len(header) >= 2 and header[0] in ("product_id", "id") and header[1].startswith("url"):
+        for r in vals[1:]:
+            pid = r[0].strip() if len(r) > 0 else ""
+            url = r[1].strip() if len(r) > 1 else ""
+            if url.startswith("http"):
+                items.append({"product_id": pid, "url": url})
+    else:
+        for r in vals[1:]:
+            url = r[0].strip() if r and len(r) > 0 else ""
+            if url.startswith("http"):
+                items.append({"product_id": "", "url": url})
+    return items
+
+def maybe_update_products_id(url, pid):
+    """
+    Jeśli w 'Products' brakowało product_id dla danego URL-a, uzupełnij.
+    """
+    if not pid:
+        return
+    try:
+        sh = GS.open_by_key(SPREADSHEET_ID)
+        ws = get_or_create_worksheet(sh, "Products", PRODUCTS_HEADERS)
+        vals = ws.get_all_values()
+        if not vals:
+            return
+        header = [c.strip().lower() for c in vals[0]]
+        if len(header) >= 2 and header[0] in ("product_id", "id") and header[1].startswith("url"):
+            for i, row in enumerate(vals[1:], start=2):
+                if len(row) > 1 and row[1].strip() == url and not row[0].strip():
+                    ws.update_acell(f"A{i}", pid)
+                    return
+    except Exception:
+        pass
+
+def append_daily_row(ws_daily, result, product_id_from_sheet):
+    """
+    Zapis do 'Daily'. Priorytet ID:
+    1) product_id z arkusza 'Products' (źródło prawdy),
+    2) jeśli puste – użyj ID wykrytego ze strony (o ile jest).
+    """
+    pid = product_id_from_sheet or result.get("product_id", "")
+    today_local = datetime.now(DATE_TZ).date().isoformat()
+    ws_daily.append_row([
+        pid,
+        today_local,
+        result["url"],
+        result.get("name", ""),
+        result.get("size_count", ""),
+        ", ".join(result.get("sizes_avail", [])),
+        ", ".join(result.get("sizes_all", [])),
+        result.get("status", "")
+    ], value_input_option="RAW")
 
 # =============== Helpery UI ===============
 def _any_visible_enabled(page: Page, texts):
@@ -441,7 +507,7 @@ def extract_product_name(page: Page):
     return ""
 
 # =============== Skan pojedynczego produktu ===============
-def probe_product(url, browser):
+def probe_product(url, browser, product_id_hint=""):
     page = browser.new_page()
     try:
         print(f"==> URL: {url}")
@@ -451,7 +517,7 @@ def probe_product(url, browser):
 
         # Twarde kody HTTP
         if code and code >= 400:
-            return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status=f"http_{code}")
+            return dict(product_id=product_id_hint, url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status=f"http_{code}")
 
         accept_cookies(page)
         scroll_into_view_of_variants(page)
@@ -464,10 +530,10 @@ def probe_product(url, browser):
             except Exception:
                 pass
             if re.search(r"404|nie znalezion|nie istnieje|usunięt|brak produktu", txt, re.I):
-                return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="product_removed")
+                return dict(product_id=product_id_hint, url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="product_removed")
             if final_url.rstrip("/") != url.rstrip("/"):
-                return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="redirected_not_product")
-            return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="not_product_page")
+                return dict(product_id=product_id_hint, url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="redirected_not_product")
+            return dict(product_id=product_id_hint, url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="not_product_page")
 
         try:
             page.wait_for_selector("text=Wybierz wariant produktu", timeout=WAIT_SELECTOR)
@@ -475,7 +541,8 @@ def probe_product(url, browser):
             pass
 
         product_name = extract_product_name(page)
-        product_id   = extract_product_id(page, url)
+        # Preferuj ID z arkusza; jeśli puste — spróbuj z karty produktu
+        product_id = product_id_hint or extract_product_id(page, url)
 
         groups = get_variant_groups(page)
         size_groups = [g for g in groups if group_is_size(g)]
@@ -530,82 +597,40 @@ def probe_product(url, browser):
         )
 
     except PWTimeout:
-        return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="timeout")
+        return dict(product_id=product_id_hint, url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status="timeout")
     except Exception as e:
         print("   ERROR:", e.__class__.__name__, str(e))
-        return dict(product_id="", url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status=f"error: {e.__class__.__name__}")
+        return dict(product_id=product_id_hint, url=url, name="", sizes_all=[], sizes_avail=[], size_count="", status=f"error: {e.__class__.__name__}")
     finally:
         try:
             page.close()
         except Exception:
             pass
 
-# =============== Arkusze: odczyt/zapis ===============
-def read_product_urls():
-    sh = GS.open_by_key(SPREADSHEET_ID)
-    ws = get_or_create_worksheet(sh, "Products", PRODUCTS_HEADERS)
-    vals = ws.get_all_values()
-    urls = []
-    if not vals:
-        return urls
-    header = [c.strip().lower() for c in vals[0]]
-    if len(header) >= 2 and header[0] in ("product_id", "id") and header[1].startswith("url"):
-        for r in vals[1:]:
-            if len(r) > 1 and r[1].startswith("http"):
-                urls.append(r[1])
-    else:
-        urls = [r[0] for r in vals[1:] if r and len(r) > 0 and r[0].startswith("http")]
-    return urls
-
-def maybe_update_products_id(url, pid):
-    if not pid:
-        return
-    try:
-        sh = GS.open_by_key(SPREADSHEET_ID)
-        ws = get_or_create_worksheet(sh, "Products", PRODUCTS_HEADERS)
-        vals = ws.get_all_values()
-        if not vals:
-            return
-        header = [c.strip().lower() for c in vals[0]]
-        if len(header) >= 2 and header[0] in ("product_id", "id") and header[1].startswith("url"):
-            for i, row in enumerate(vals[1:], start=2):
-                if len(row) > 1 and row[1] == url and not row[0]:
-                    ws.update_acell(f"A{i}", pid)
-                    return
-    except Exception:
-        pass
-
-def append_daily_row(ws_daily, result):
-    today_local = datetime.now(DATE_TZ).date().isoformat()  # data w strefie Europe/Warsaw
-    ws_daily.append_row([
-        result.get("product_id", ""),
-        today_local,
-        result["url"],
-        result["name"],
-        result["size_count"],
-        ", ".join(result["sizes_avail"]),
-        ", ".join(result["sizes_all"]),
-        result["status"]
-    ], value_input_option="RAW")
-
 # =============== Główna pętla ===============
 def main():
     sh = GS.open_by_key(SPREADSHEET_ID)
-
-    # Czyścimy 'Daily' i zostawiamy tylko nagłówek – zawsze tylko aktualne dane
     ws_daily = reset_daily_sheet(sh)
 
-    urls = read_product_urls()
-    if not urls:
+    products = read_products_sheet()
+    if not products:
         print("Brak URL-i w zakładce 'Products'. Dodaj co najmniej jeden adres produktu i uruchom ponownie.")
         return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        for url in urls:
-            res = probe_product(url, browser)
-            append_daily_row(ws_daily, res)
-            maybe_update_products_id(url, res.get("product_id", ""))
+        for item in products:
+            url = item["url"]
+            pid_from_sheet = item.get("product_id", "").strip()
+            res = probe_product(url, browser, product_id_hint=pid_from_sheet)
+
+            # Zapis do Daily (z priorytetem ID z arkusza)
+            append_daily_row(ws_daily, res, product_id_from_sheet=pid_from_sheet)
+
+            # Jeśli w arkuszu brakowało ID, a ze strony je odczytaliśmy – uzupełnij
+            if not pid_from_sheet and res.get("product_id"):
+                maybe_update_products_id(url, res["product_id"])
+
             time.sleep(0.5)  # łagodnie dla sklepu
         browser.close()
 
